@@ -196,3 +196,255 @@ func formatInt64(n int64) string {
 
 	return string(digits)
 }
+
+// FormatMarkdownV2 processes text with markdown formatting
+// Supports: *bold*, _italic_, `code`, ```pre```, [link](url), ~strikethrough~, __underline__, ||spoiler||
+// Escapes special characters outside of formatting blocks
+func FormatMarkdownV2(text string) string {
+	if text == "" {
+		return ""
+	}
+
+	var result strings.Builder
+	runes := []rune(text)
+	i := 0
+
+	for i < len(runes) {
+		// Check for code block ```
+		if i+2 < len(runes) && runes[i] == '`' && runes[i+1] == '`' && runes[i+2] == '`' {
+			end := findClosingCodeBlock(runes, i+3)
+			if end != -1 {
+				result.WriteString(string(runes[i : end+3]))
+				i = end + 3
+				continue
+			}
+		}
+
+		// Check for inline code `
+		if runes[i] == '`' {
+			end := findClosingChar(runes, i+1, '`')
+			if end != -1 {
+				result.WriteString(string(runes[i : end+1]))
+				i = end + 1
+				continue
+			}
+		}
+
+		// Check for spoiler ||
+		if i+1 < len(runes) && runes[i] == '|' && runes[i+1] == '|' {
+			end := findClosingDouble(runes, i+2, '|')
+			if end != -1 {
+				// Content inside spoiler needs escaping
+				content := escapeInsideFormat(string(runes[i+2 : end]))
+				result.WriteString("||")
+				result.WriteString(content)
+				result.WriteString("||")
+				i = end + 2
+				continue
+			}
+		}
+
+		// Check for underline __
+		if i+1 < len(runes) && runes[i] == '_' && runes[i+1] == '_' {
+			end := findClosingDouble(runes, i+2, '_')
+			if end != -1 {
+				content := escapeInsideFormat(string(runes[i+2 : end]))
+				result.WriteString("__")
+				result.WriteString(content)
+				result.WriteString("__")
+				i = end + 2
+				continue
+			}
+		}
+
+		// Check for bold *
+		if runes[i] == '*' {
+			end := findClosingChar(runes, i+1, '*')
+			if end != -1 {
+				content := escapeInsideFormat(string(runes[i+1 : end]))
+				result.WriteRune('*')
+				result.WriteString(content)
+				result.WriteRune('*')
+				i = end + 1
+				continue
+			}
+		}
+
+		// Check for italic _
+		if runes[i] == '_' && (i+1 >= len(runes) || runes[i+1] != '_') {
+			end := findClosingChar(runes, i+1, '_')
+			if end != -1 && (end+1 >= len(runes) || runes[end+1] != '_') {
+				content := escapeInsideFormat(string(runes[i+1 : end]))
+				result.WriteRune('_')
+				result.WriteString(content)
+				result.WriteRune('_')
+				i = end + 1
+				continue
+			}
+		}
+
+		// Check for strikethrough ~
+		if runes[i] == '~' {
+			end := findClosingChar(runes, i+1, '~')
+			if end != -1 {
+				content := escapeInsideFormat(string(runes[i+1 : end]))
+				result.WriteRune('~')
+				result.WriteString(content)
+				result.WriteRune('~')
+				i = end + 1
+				continue
+			}
+		}
+
+		// Check for link [text](url)
+		if runes[i] == '[' {
+			linkEnd := parseLinkMarkdown(runes, i)
+			if linkEnd != -1 {
+				result.WriteString(string(runes[i : linkEnd+1]))
+				i = linkEnd + 1
+				continue
+			}
+		}
+
+		// Escape regular character if it's special
+		if isMarkdownV2Special(runes[i]) {
+			result.WriteRune('\\')
+		}
+		result.WriteRune(runes[i])
+		i++
+	}
+
+	return result.String()
+}
+
+// findClosingCodeBlock finds closing ``` for code block
+func findClosingCodeBlock(runes []rune, start int) int {
+	for i := start; i+2 < len(runes); i++ {
+		if runes[i] == '`' && runes[i+1] == '`' && runes[i+2] == '`' {
+			return i
+		}
+	}
+	return -1
+}
+
+// findClosingChar finds closing character
+func findClosingChar(runes []rune, start int, char rune) int {
+	for i := start; i < len(runes); i++ {
+		if runes[i] == char {
+			return i
+		}
+		// Skip escaped characters
+		if runes[i] == '\\' && i+1 < len(runes) {
+			i++
+		}
+	}
+	return -1
+}
+
+// findClosingDouble finds closing double character (||, __)
+func findClosingDouble(runes []rune, start int, char rune) int {
+	for i := start; i+1 < len(runes); i++ {
+		if runes[i] == char && runes[i+1] == char {
+			return i
+		}
+		// Skip escaped characters
+		if runes[i] == '\\' && i+1 < len(runes) {
+			i++
+		}
+	}
+	return -1
+}
+
+// parseLinkMarkdown parses [text](url) and returns end index
+func parseLinkMarkdown(runes []rune, start int) int {
+	if runes[start] != '[' {
+		return -1
+	}
+
+	// Find ]
+	bracketEnd := -1
+	for i := start + 1; i < len(runes); i++ {
+		if runes[i] == ']' {
+			bracketEnd = i
+			break
+		}
+		if runes[i] == '\\' && i+1 < len(runes) {
+			i++
+		}
+	}
+
+	if bracketEnd == -1 || bracketEnd+1 >= len(runes) || runes[bracketEnd+1] != '(' {
+		return -1
+	}
+
+	// Find )
+	parenEnd := -1
+	depth := 1
+	for i := bracketEnd + 2; i < len(runes); i++ {
+		if runes[i] == '(' {
+			depth++
+		} else if runes[i] == ')' {
+			depth--
+			if depth == 0 {
+				parenEnd = i
+				break
+			}
+		}
+		if runes[i] == '\\' && i+1 < len(runes) {
+			i++
+		}
+	}
+
+	return parenEnd
+}
+
+// escapeInsideFormat escapes special chars inside formatting blocks
+// Does not escape the formatting character itself
+func escapeInsideFormat(text string) string {
+	// Inside formatted text, we need to escape: ) ( ` \ and >
+	// but NOT the formatting chars themselves
+	specialInside := []string{"\\", "`", ")", "(", ">"}
+	result := text
+	for _, char := range specialInside {
+		result = strings.ReplaceAll(result, char, "\\"+char)
+	}
+	return result
+}
+
+// isMarkdownV2Special checks if rune is a special MarkdownV2 character
+func isMarkdownV2Special(r rune) bool {
+	switch r {
+	case '_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!', '\\':
+		return true
+	}
+	return false
+}
+
+// StripMarkdown removes all markdown formatting from text
+func StripMarkdown(text string) string {
+	// Remove code blocks
+	result := text
+
+	// Simple removal of formatting characters
+	for _, char := range []string{"```", "||", "__", "*", "_", "~", "`"} {
+		result = strings.ReplaceAll(result, char, "")
+	}
+
+	// Remove escape characters
+	result = strings.ReplaceAll(result, "\\", "")
+
+	return result
+}
+
+// TruncateText truncates text to maxLen, adding "..." if truncated
+// Respects UTF-8 runes
+func TruncateText(text string, maxLen int) string {
+	runes := []rune(text)
+	if len(runes) <= maxLen {
+		return text
+	}
+	if maxLen <= 3 {
+		return string(runes[:maxLen])
+	}
+	return string(runes[:maxLen-3]) + "..."
+}

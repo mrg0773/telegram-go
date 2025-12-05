@@ -214,6 +214,138 @@ func webhookHandler(w http.ResponseWriter, r *http.Request) {
 }
 ```
 
+## Action Execution (for handler integration)
+
+The library provides `ExecuteAction` method for executing message actions from handler-go-v3.
+
+### Action Structure
+
+```go
+type Action struct {
+    Activity string      // "message"
+    Project  string      // Project slug
+    User     ActionUser  // User info (TgID required)
+    Content  Content     // Message content
+    Token    string      // Bot token
+}
+
+type ActionUser struct {
+    TgID int64  // Telegram user ID (chat_id)
+    ID   string // Internal user ID
+}
+
+type Content struct {
+    Type        string                 // text, inline_keyboard, virtual_keyboard, sticker, dice, etc.
+    Stream      string                 // "tg_direct"
+    Text        string                 // Message text
+    Attachment  *Attachment            // Media attachment
+    Buts        []string               // Button labels
+    Actions     []json.RawMessage      // Button callback actions
+    ReplyMarkup map[string]interface{} // Custom reply markup
+    ColumnNum   *int                   // Keyboard column count (default: 3)
+    Spices      map[string]interface{} // Extra params (parse_mode, etc.)
+    Parameters  Parameters             // Action parameters
+}
+```
+
+### Supported Content Types
+
+- `text` - Plain text message
+- `inline_keyboard` - Text with inline keyboard
+- `virtual_keyboard` - Text with reply keyboard
+- `sticker` - Sticker message
+- `dice` - Dice animation
+- `contact` - Contact message
+- `poll` - Poll message
+- `game` - Game message
+- `venue` - Venue message
+
+### Attachment Types
+
+- `photo` - Photo by URL or file_id
+- `document` - Document file
+- `video` - Video file
+- `audio` - Audio file
+- `voice` - Voice message
+- `video_note` - Round video
+
+### Example Usage
+
+```go
+// Create client
+client := telegram.NewClient(botToken, logger)
+
+// Create action
+action := &telegram.Action{
+    Activity: "message",
+    Project:  "myproject",
+    User: telegram.ActionUser{
+        TgID: 123456789,
+        ID:   "user123",
+    },
+    Content: telegram.Content{
+        Type:   "inline_keyboard",
+        Stream: "tg_direct",
+        Text:   "Choose an option:",
+        Buts:   []string{"Option 1", "Option 2", "Option 3"},
+        Spices: map[string]interface{}{
+            "parse_mode": "MarkdownV2",
+        },
+    },
+}
+
+// Execute action (with callback saver for inline keyboards)
+result, err := client.ExecuteAction(ctx, action, myCallbackSaver)
+if err != nil {
+    log.Printf("Error: %v", err)
+    return
+}
+
+log.Printf("Message sent, ID: %d", result.MessageID)
+```
+
+### Callback Data Saver Interface
+
+For inline keyboards, implement `CallbackSaver` to store callback data:
+
+```go
+type CallbackSaver interface {
+    SaveCallbackData(ctx context.Context, data *CallbackData) error
+    SaveCallbackDataBatch(ctx context.Context, data []*CallbackData) error
+}
+
+type CallbackData struct {
+    Project   string
+    UserID    string
+    QueryData string          // Generated hash
+    Action    json.RawMessage // Action to execute on callback
+}
+```
+
+### Smart MarkdownV2 Formatting
+
+The `FormatMarkdownV2` function automatically escapes special characters while preserving markdown formatting:
+
+```go
+// Input: "Hello! *bold* and _italic_ with [link](https://example.com)"
+// Output: "Hello\\! *bold* and _italic_ with [link](https://example.com)"
+
+text := telegram.FormatMarkdownV2("Hello! Check *this* out.")
+client.SendMessage(ctx, chatID, text, map[string]interface{}{
+    "parse_mode": "MarkdownV2",
+})
+```
+
+Supported formatting:
+- `*bold*`
+- `_italic_`
+- `__underline__`
+- `~strikethrough~`
+- `||spoiler||`
+- `` `code` ``
+- ` ```code block``` `
+- `[text](url)`
+
 ## License
 
 MIT
