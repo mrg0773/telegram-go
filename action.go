@@ -4,16 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"math"
+
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
 // Action represents a message action to execute
 // This is the main entry point for sending messages from handler
 type Action struct {
-	Activity string      `json:"activity,omitempty"` // "message"
-	Project  string      `json:"slag,omitempty"`     // Project slug
-	User     ActionUser  `json:"user,omitempty"`     // User info (TgID required)
-	Content  Content     `json:"content,omitempty"`  // Message content
-	Token    string      `json:"-"`                  // Bot token (passed separately)
+	Activity string     `json:"activity,omitempty"` // "message"
+	Project  string     `json:"slag,omitempty"`     // Project slug
+	User     ActionUser `json:"user,omitempty"`     // User info (TgID required)
+	Content  Content    `json:"content,omitempty"`  // Message content
+	Token    string     `json:"-"`                  // Bot token (passed separately)
 }
 
 // ActionUser represents user information for action
@@ -56,10 +58,10 @@ type Parameters struct {
 
 // ActionResult represents the result of action execution
 type ActionResult struct {
-	Success   bool     `json:"success"`
-	MessageID int64    `json:"message_id,omitempty"`
+	Success   bool      `json:"success"`
+	MessageID int64     `json:"message_id,omitempty"`
 	Response  *Response `json:"response,omitempty"`
-	Error     error    `json:"error,omitempty"`
+	Error     error     `json:"error,omitempty"`
 }
 
 // CallbackData represents callback query data for keyboard buttons
@@ -76,7 +78,7 @@ type CallbackSaver interface {
 	SaveCallbackDataBatch(ctx context.Context, data []*CallbackData) error
 }
 
-// ExecuteAction executes a message action
+// ExecuteAction executes a message action using tgbotapi
 // Returns ActionResult with message ID on success or error on failure
 func (c *Client) ExecuteAction(ctx context.Context, action *Action, callbackSaver CallbackSaver) (*ActionResult, error) {
 	if action.Content.Stream != "tg_direct" && action.Content.Stream != "" {
@@ -84,154 +86,288 @@ func (c *Client) ExecuteAction(ctx context.Context, action *Action, callbackSave
 		return &ActionResult{Success: false}, nil
 	}
 
-	// Build Telegram message params
-	tgMessage := make(map[string]interface{})
-	tgMessage["chat_id"] = action.User.TgID
+	if err := c.initBot(); err != nil {
+		return &ActionResult{Success: false, Error: err}, err
+	}
 
 	// Apply text formatting
 	text := action.Content.Text
-	if parseMode, ok := action.Content.Spices["parse_mode"]; ok {
+	parseMode := ""
+	if pm, ok := action.Content.Spices["parse_mode"].(string); ok {
+		parseMode = pm
 		if parseMode == "MarkdownV2" {
 			text = FormatMarkdownV2(text)
 		}
 	}
 
-	// Copy spices to message params
-	for k, v := range action.Content.Spices {
-		tgMessage[k] = v
-	}
-
-	// Determine method and build message
-	method := c.determineMethod(action, tgMessage, text)
-
-	// Process keyboards
-	if err := c.processKeyboards(ctx, action, tgMessage, callbackSaver); err != nil {
-		return &ActionResult{Success: false, Error: err}, err
-	}
-
 	// Send chat action if configured
 	if action.Content.Parameters.SendReaction != nil {
-		_ = c.SendChatAction(ctx, action.User.TgID, *action.Content.Parameters.SendReaction)
+		chatAction := tgbotapi.NewChatAction(action.User.TgID, *action.Content.Parameters.SendReaction)
+		_, _ = c.bot.Request(chatAction)
 	}
 
-	// Send message
-	resp, err := c.Call(ctx, method, tgMessage)
+	// Build and send message based on content type
+	var sent tgbotapi.Message
+	var err error
+
+	switch action.Content.Type {
+	case "sticker":
+		sent, err = c.sendStickerAction(action)
+	case "dice":
+		sent, err = c.sendDiceAction(action)
+	case "contact":
+		sent, err = c.sendContactAction(action)
+	case "poll":
+		sent, err = c.sendPollAction(action, parseMode)
+	case "game":
+		sent, err = c.sendGameAction(action)
+	case "venue":
+		sent, err = c.sendVenueAction(action)
+	default:
+		// Text-based messages (text, inline_keyboard, virtual_keyboard, or empty)
+		sent, err = c.sendTextBasedAction(ctx, action, text, parseMode, callbackSaver)
+	}
+
 	if err != nil {
-		return &ActionResult{Success: false, Response: resp, Error: err}, err
-	}
-
-	// Extract message ID from response
-	var msgID int64
-	if resp != nil && resp.Result != nil {
-		var result map[string]interface{}
-		if json.Unmarshal(resp.Result, &result) == nil {
-			if id, ok := result["message_id"].(float64); ok {
-				msgID = int64(id)
-			}
-		}
+		return &ActionResult{Success: false, Error: err}, err
 	}
 
 	return &ActionResult{
 		Success:   true,
-		MessageID: msgID,
-		Response:  resp,
+		MessageID: int64(sent.MessageID),
 	}, nil
 }
 
-// determineMethod determines Telegram API method based on content type
-func (c *Client) determineMethod(action *Action, tgMessage map[string]interface{}, text string) string {
-	method := ""
-
-	switch action.Content.Type {
-	case "sticker":
-		tgMessage["sticker"] = action.Content.Attachment.Sticker
-		method = "sendSticker"
-	case "dice":
-		tgMessage["emoji"] = action.Content.Attachment.Dice
-		method = "sendDice"
-	case "contact":
-		if cont, ok := action.Content.Attachment.Contact.(map[string]interface{}); ok {
-			tgMessage["phone_number"] = cont["phone_number"]
-			tgMessage["first_name"] = cont["first_name"]
-			tgMessage["last_name"] = cont["last_name"]
-			tgMessage["vcard"] = cont["vcard"]
-		}
-		method = "sendContact"
-	case "poll":
-		if poll, ok := action.Content.Attachment.Poll.(map[string]interface{}); ok {
-			for k, v := range poll {
-				tgMessage[k] = v
-			}
-			// Format explanation if present
-			if explanation, ok := tgMessage["explanation"].(string); ok {
-				tgMessage["explanation"] = FormatMarkdownV2(explanation)
-			}
-		}
-		method = "sendPoll"
-	case "game":
-		tgMessage["game_short_name"] = action.Content.Attachment.GameShortName
-		method = "sendGame"
-	case "venue":
-		if venue, ok := action.Content.Attachment.Venue.(map[string]interface{}); ok {
-			for k, v := range venue {
-				tgMessage[k] = v
-			}
-		}
-		method = "sendVenue"
+// sendStickerAction sends a sticker
+func (c *Client) sendStickerAction(action *Action) (tgbotapi.Message, error) {
+	var file tgbotapi.RequestFileData
+	sticker := action.Content.Attachment.Sticker
+	if len(sticker) > 100 || (len(sticker) > 0 && sticker[0] == 'h') {
+		file = tgbotapi.FileURL(sticker)
+	} else {
+		file = tgbotapi.FileID(sticker)
 	}
-
-	// Text-based messages
-	if method == "" && (action.Content.Type == "text" || action.Content.Type == "inline_keyboard" || action.Content.Type == "virtual_keyboard" || action.Content.Type == "") {
-		if action.Content.Attachment == nil || action.Content.Attachment.URL == "" {
-			tgMessage["text"] = text
-			method = "sendMessage"
-		} else {
-			tgMessage["caption"] = text
-
-			switch action.Content.Attachment.Type {
-			case "photo":
-				tgMessage["photo"] = action.Content.Attachment.URL
-				method = "sendPhoto"
-			case "document":
-				tgMessage["document"] = action.Content.Attachment.URL
-				method = "sendDocument"
-			case "video":
-				tgMessage["video"] = action.Content.Attachment.URL
-				method = "sendVideo"
-			case "audio":
-				tgMessage["audio"] = action.Content.Attachment.URL
-				method = "sendAudio"
-			case "video_note":
-				tgMessage["video_note"] = action.Content.Attachment.URL
-				method = "sendVideoNote"
-			case "voice":
-				tgMessage["voice"] = action.Content.Attachment.URL
-				method = "sendVoice"
-			default:
-				tgMessage["text"] = text
-				method = "sendMessage"
-			}
-		}
-	}
-
-	return method
+	msg := tgbotapi.NewSticker(action.User.TgID, file)
+	return c.bot.Send(msg)
 }
 
-// processKeyboards handles inline and virtual keyboards
-func (c *Client) processKeyboards(ctx context.Context, action *Action, tgMessage map[string]interface{}, callbackSaver CallbackSaver) error {
-	// If reply_markup is already set, process it
-	if action.Content.ReplyMarkup != nil {
-		tgMessage["reply_markup"] = action.Content.ReplyMarkup
+// sendDiceAction sends a dice animation
+func (c *Client) sendDiceAction(action *Action) (tgbotapi.Message, error) {
+	msg := tgbotapi.NewDice(action.User.TgID)
+	if action.Content.Attachment != nil && action.Content.Attachment.Dice != "" {
+		msg.Emoji = action.Content.Attachment.Dice
+	}
+	return c.bot.Send(msg)
+}
 
-		// Process inline_keyboard callback data
-		if inlineKeyboard, ok := action.Content.ReplyMarkup["inline_keyboard"]; ok {
-			return c.processInlineKeyboard(ctx, action, tgMessage, inlineKeyboard, callbackSaver)
+// sendContactAction sends a contact
+func (c *Client) sendContactAction(action *Action) (tgbotapi.Message, error) {
+	cont, ok := action.Content.Attachment.Contact.(map[string]interface{})
+	if !ok {
+		return tgbotapi.Message{}, nil
+	}
+
+	phoneNumber, _ := cont["phone_number"].(string)
+	firstName, _ := cont["first_name"].(string)
+
+	msg := tgbotapi.NewContact(action.User.TgID, phoneNumber, firstName)
+	if lastName, ok := cont["last_name"].(string); ok {
+		msg.LastName = lastName
+	}
+	if vcard, ok := cont["vcard"].(string); ok {
+		msg.VCard = vcard
+	}
+	return c.bot.Send(msg)
+}
+
+// sendPollAction sends a poll
+func (c *Client) sendPollAction(action *Action, parseMode string) (tgbotapi.Message, error) {
+	poll, ok := action.Content.Attachment.Poll.(map[string]interface{})
+	if !ok {
+		return tgbotapi.Message{}, nil
+	}
+
+	question, _ := poll["question"].(string)
+	var options []string
+	if opts, ok := poll["options"].([]interface{}); ok {
+		for _, opt := range opts {
+			if s, ok := opt.(string); ok {
+				options = append(options, s)
+			}
 		}
+	}
+
+	msg := tgbotapi.NewPoll(action.User.TgID, question, options...)
+
+	if isAnonymous, ok := poll["is_anonymous"].(bool); ok {
+		msg.IsAnonymous = isAnonymous
+	}
+	if pollType, ok := poll["type"].(string); ok {
+		msg.Type = pollType
+	}
+	if allowsMultiple, ok := poll["allows_multiple_answers"].(bool); ok {
+		msg.AllowsMultipleAnswers = allowsMultiple
+	}
+	if explanation, ok := poll["explanation"].(string); ok {
+		if parseMode == "MarkdownV2" {
+			explanation = FormatMarkdownV2(explanation)
+		}
+		msg.Explanation = explanation
+		msg.ExplanationParseMode = parseMode
+	}
+
+	return c.bot.Send(msg)
+}
+
+// sendGameAction sends a game
+func (c *Client) sendGameAction(action *Action) (tgbotapi.Message, error) {
+	msg := tgbotapi.GameConfig{
+		BaseChat:      tgbotapi.BaseChat{ChatID: action.User.TgID},
+		GameShortName: action.Content.Attachment.GameShortName,
+	}
+	return c.bot.Send(msg)
+}
+
+// sendVenueAction sends a venue
+func (c *Client) sendVenueAction(action *Action) (tgbotapi.Message, error) {
+	venue, ok := action.Content.Attachment.Venue.(map[string]interface{})
+	if !ok {
+		return tgbotapi.Message{}, nil
+	}
+
+	latitude, _ := venue["latitude"].(float64)
+	longitude, _ := venue["longitude"].(float64)
+	title, _ := venue["title"].(string)
+	address, _ := venue["address"].(string)
+
+	msg := tgbotapi.NewVenue(action.User.TgID, title, address, latitude, longitude)
+	if foursquareID, ok := venue["foursquare_id"].(string); ok {
+		msg.FoursquareID = foursquareID
+	}
+	if foursquareType, ok := venue["foursquare_type"].(string); ok {
+		msg.FoursquareType = foursquareType
+	}
+	return c.bot.Send(msg)
+}
+
+// sendTextBasedAction handles text, inline_keyboard, virtual_keyboard messages
+func (c *Client) sendTextBasedAction(ctx context.Context, action *Action, text, parseMode string, callbackSaver CallbackSaver) (tgbotapi.Message, error) {
+	chatID := action.User.TgID
+
+	// Check if there's an attachment (media message)
+	if action.Content.Attachment != nil && action.Content.Attachment.URL != "" {
+		return c.sendMediaAction(ctx, action, text, parseMode, callbackSaver)
+	}
+
+	// Plain text message
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ParseMode = parseMode
+
+	// Apply reply markup
+	if err := c.applyReplyMarkup(ctx, action, &msg.BaseChat, callbackSaver); err != nil {
+		return tgbotapi.Message{}, err
+	}
+
+	return c.bot.Send(msg)
+}
+
+// sendMediaAction sends a media message with caption
+func (c *Client) sendMediaAction(ctx context.Context, action *Action, caption, parseMode string, callbackSaver CallbackSaver) (tgbotapi.Message, error) {
+	chatID := action.User.TgID
+	attachment := action.Content.Attachment
+
+	var baseChat tgbotapi.BaseChat
+	var sent tgbotapi.Message
+	var err error
+
+	switch attachment.Type {
+	case "photo":
+		msg := tgbotapi.NewPhoto(chatID, tgbotapi.FileURL(attachment.URL))
+		msg.Caption = caption
+		msg.ParseMode = parseMode
+		baseChat = msg.BaseChat
+		if err := c.applyReplyMarkup(ctx, action, &msg.BaseChat, callbackSaver); err != nil {
+			return tgbotapi.Message{}, err
+		}
+		sent, err = c.bot.Send(msg)
+
+	case "document":
+		msg := tgbotapi.NewDocument(chatID, tgbotapi.FileURL(attachment.URL))
+		msg.Caption = caption
+		msg.ParseMode = parseMode
+		baseChat = msg.BaseChat
+		if err := c.applyReplyMarkup(ctx, action, &msg.BaseChat, callbackSaver); err != nil {
+			return tgbotapi.Message{}, err
+		}
+		sent, err = c.bot.Send(msg)
+
+	case "video":
+		msg := tgbotapi.NewVideo(chatID, tgbotapi.FileURL(attachment.URL))
+		msg.Caption = caption
+		msg.ParseMode = parseMode
+		baseChat = msg.BaseChat
+		if err := c.applyReplyMarkup(ctx, action, &msg.BaseChat, callbackSaver); err != nil {
+			return tgbotapi.Message{}, err
+		}
+		sent, err = c.bot.Send(msg)
+
+	case "audio":
+		msg := tgbotapi.NewAudio(chatID, tgbotapi.FileURL(attachment.URL))
+		msg.Caption = caption
+		msg.ParseMode = parseMode
+		baseChat = msg.BaseChat
+		if err := c.applyReplyMarkup(ctx, action, &msg.BaseChat, callbackSaver); err != nil {
+			return tgbotapi.Message{}, err
+		}
+		sent, err = c.bot.Send(msg)
+
+	case "voice":
+		msg := tgbotapi.NewVoice(chatID, tgbotapi.FileURL(attachment.URL))
+		msg.Caption = caption
+		msg.ParseMode = parseMode
+		baseChat = msg.BaseChat
+		if err := c.applyReplyMarkup(ctx, action, &msg.BaseChat, callbackSaver); err != nil {
+			return tgbotapi.Message{}, err
+		}
+		sent, err = c.bot.Send(msg)
+
+	case "video_note":
+		msg := tgbotapi.NewVideoNote(chatID, 240, tgbotapi.FileURL(attachment.URL))
+		baseChat = msg.BaseChat
+		if err := c.applyReplyMarkup(ctx, action, &msg.BaseChat, callbackSaver); err != nil {
+			return tgbotapi.Message{}, err
+		}
+		sent, err = c.bot.Send(msg)
+
+	default:
+		// Fallback to text message
+		msg := tgbotapi.NewMessage(chatID, caption)
+		msg.ParseMode = parseMode
+		baseChat = msg.BaseChat
+		if err := c.applyReplyMarkup(ctx, action, &msg.BaseChat, callbackSaver); err != nil {
+			return tgbotapi.Message{}, err
+		}
+		sent, err = c.bot.Send(msg)
+	}
+
+	_ = baseChat // suppress unused variable warning
+	return sent, err
+}
+
+// applyReplyMarkup applies keyboard markup to the message
+func (c *Client) applyReplyMarkup(ctx context.Context, action *Action, baseChat *tgbotapi.BaseChat, callbackSaver CallbackSaver) error {
+	// If custom reply_markup is provided
+	if action.Content.ReplyMarkup != nil {
+		markup, err := c.convertReplyMarkup(ctx, action, callbackSaver)
+		if err != nil {
+			return err
+		}
+		baseChat.ReplyMarkup = markup
 		return nil
 	}
 
-	// Generate keyboard from buts
-	if action.Content.Buts == nil || len(action.Content.Buts) == 0 {
+	// Generate keyboard from buttons
+	if len(action.Content.Buts) == 0 {
 		return nil
 	}
 
@@ -242,136 +378,187 @@ func (c *Client) processKeyboards(ctx context.Context, action *Action, tgMessage
 
 	switch action.Content.Type {
 	case "inline_keyboard":
-		return c.buildInlineKeyboard(ctx, action, tgMessage, colNum, callbackSaver)
+		markup, err := c.buildInlineKeyboardMarkup(ctx, action, colNum, callbackSaver)
+		if err != nil {
+			return err
+		}
+		baseChat.ReplyMarkup = markup
 	case "virtual_keyboard":
-		c.buildVirtualKeyboard(action, tgMessage, colNum)
+		baseChat.ReplyMarkup = c.buildReplyKeyboardMarkup(action, colNum)
 	}
 
 	return nil
 }
 
-// buildInlineKeyboard builds inline keyboard and saves callback data
-func (c *Client) buildInlineKeyboard(ctx context.Context, action *Action, tgMessage map[string]interface{}, colNum int, callbackSaver CallbackSaver) error {
-	// Generate callback data hashes
-	callbackData := make([]string, len(action.Content.Buts))
-	for i := range action.Content.Buts {
-		callbackData[i] = GenerateCallbackHash(i)
+// convertReplyMarkup converts custom reply_markup to tgbotapi format
+func (c *Client) convertReplyMarkup(ctx context.Context, action *Action, callbackSaver CallbackSaver) (interface{}, error) {
+	// Check for inline_keyboard in reply_markup
+	if inlineKeyboard, ok := action.Content.ReplyMarkup["inline_keyboard"]; ok {
+		rows, ok := inlineKeyboard.([]interface{})
+		if !ok {
+			return action.Content.ReplyMarkup, nil
+		}
+
+		var keyboard [][]tgbotapi.InlineKeyboardButton
+		var callbackQueries []*CallbackData
+		index := 0
+
+		for _, row := range rows {
+			rowItems, ok := row.([]interface{})
+			if !ok {
+				continue
+			}
+
+			var keyboardRow []tgbotapi.InlineKeyboardButton
+			for _, item := range rowItems {
+				btn, ok := item.(map[string]interface{})
+				if !ok {
+					continue
+				}
+
+				text, _ := btn["text"].(string)
+				button := tgbotapi.InlineKeyboardButton{Text: text}
+
+				// Check for URL button
+				if url, ok := btn["url"].(string); ok {
+					button.URL = &url
+				} else {
+					// Generate callback data
+					hash := GenerateCallbackHash(index)
+					button.CallbackData = &hash
+
+					// Prepare callback data for saving
+					data := &CallbackData{
+						Project:   action.Project,
+						UserID:    action.User.ID,
+						QueryData: hash,
+					}
+					if action.Content.Actions != nil && index < len(action.Content.Actions) {
+						data.Action = action.Content.Actions[index]
+					}
+					callbackQueries = append(callbackQueries, data)
+					index++
+				}
+
+				keyboardRow = append(keyboardRow, button)
+			}
+			keyboard = append(keyboard, keyboardRow)
+		}
+
+		// Save callback data
+		if callbackSaver != nil && len(callbackQueries) > 0 {
+			if err := callbackSaver.SaveCallbackDataBatch(ctx, callbackQueries); err != nil {
+				return nil, err
+			}
+		}
+
+		return tgbotapi.InlineKeyboardMarkup{InlineKeyboard: keyboard}, nil
 	}
 
-	// Save callback data to database if saver provided
-	if callbackSaver != nil {
-		for i, hash := range callbackData {
-			data := &CallbackData{
-				Project:   action.Project,
-				UserID:    action.User.ID,
-				QueryData: hash,
+	// Check for regular keyboard
+	if keyboard, ok := action.Content.ReplyMarkup["keyboard"]; ok {
+		rows, ok := keyboard.([]interface{})
+		if !ok {
+			return action.Content.ReplyMarkup, nil
+		}
+
+		var replyKeyboard [][]tgbotapi.KeyboardButton
+		for _, row := range rows {
+			rowItems, ok := row.([]interface{})
+			if !ok {
+				continue
 			}
 
-			if action.Content.Actions != nil && i < len(action.Content.Actions) {
-				data.Action = action.Content.Actions[i]
+			var keyboardRow []tgbotapi.KeyboardButton
+			for _, item := range rowItems {
+				switch v := item.(type) {
+				case string:
+					keyboardRow = append(keyboardRow, tgbotapi.NewKeyboardButton(v))
+				case map[string]interface{}:
+					text, _ := v["text"].(string)
+					keyboardRow = append(keyboardRow, tgbotapi.NewKeyboardButton(text))
+				}
 			}
+			replyKeyboard = append(replyKeyboard, keyboardRow)
+		}
 
-			if err := callbackSaver.SaveCallbackData(ctx, data); err != nil {
-				return err
-			}
+		markup := tgbotapi.NewReplyKeyboard(replyKeyboard...)
+		if resize, ok := action.Content.ReplyMarkup["resize_keyboard"].(bool); ok {
+			markup.ResizeKeyboard = resize
+		}
+		if oneTime, ok := action.Content.ReplyMarkup["one_time_keyboard"].(bool); ok {
+			markup.OneTimeKeyboard = oneTime
+		}
+
+		return markup, nil
+	}
+
+	return action.Content.ReplyMarkup, nil
+}
+
+// buildInlineKeyboardMarkup builds inline keyboard from buttons
+func (c *Client) buildInlineKeyboardMarkup(ctx context.Context, action *Action, colNum int, callbackSaver CallbackSaver) (tgbotapi.InlineKeyboardMarkup, error) {
+	// Generate callback data hashes
+	callbackData := make([]string, len(action.Content.Buts))
+	var callbackQueries []*CallbackData
+
+	for i := range action.Content.Buts {
+		hash := GenerateCallbackHash(i)
+		callbackData[i] = hash
+
+		data := &CallbackData{
+			Project:   action.Project,
+			UserID:    action.User.ID,
+			QueryData: hash,
+		}
+		if action.Content.Actions != nil && i < len(action.Content.Actions) {
+			data.Action = action.Content.Actions[i]
+		}
+		callbackQueries = append(callbackQueries, data)
+	}
+
+	// Save callback data
+	if callbackSaver != nil && len(callbackQueries) > 0 {
+		if err := callbackSaver.SaveCallbackDataBatch(ctx, callbackQueries); err != nil {
+			return tgbotapi.InlineKeyboardMarkup{}, err
 		}
 	}
 
 	// Build keyboard
 	rowCount := int(math.Ceil(float64(len(action.Content.Buts)) / float64(colNum)))
-	keyboard := make([][]InlineKeyboardButton, rowCount)
+	keyboard := make([][]tgbotapi.InlineKeyboardButton, 0, rowCount)
 
-	for i, k := 0, 0; i < len(action.Content.Buts); i += colNum {
-		var row []InlineKeyboardButton
+	for i := 0; i < len(action.Content.Buts); i += colNum {
+		var row []tgbotapi.InlineKeyboardButton
 		for j := 0; j < colNum && (i+j) < len(action.Content.Buts); j++ {
-			row = append(row, InlineKeyboardButton{
-				Text:         action.Content.Buts[i+j],
-				CallbackData: callbackData[i+j],
-			})
+			idx := i + j
+			row = append(row, tgbotapi.NewInlineKeyboardButtonData(
+				action.Content.Buts[idx],
+				callbackData[idx],
+			))
 		}
-		keyboard[k] = row
-		k++
+		keyboard = append(keyboard, row)
 	}
 
-	tgMessage["reply_markup"] = map[string]interface{}{
-		"inline_keyboard": keyboard,
-	}
-
-	return nil
+	return tgbotapi.InlineKeyboardMarkup{InlineKeyboard: keyboard}, nil
 }
 
-// processInlineKeyboard processes existing inline keyboard and saves callback data
-func (c *Client) processInlineKeyboard(ctx context.Context, action *Action, tgMessage map[string]interface{}, inlineKeyboard interface{}, callbackSaver CallbackSaver) error {
-	rows, ok := inlineKeyboard.([]interface{})
-	if !ok {
-		return nil
-	}
-
-	index := 0
-	var callbackQueries []*CallbackData
-
-	for i, row := range rows {
-		rowItems, ok := row.([]interface{})
-		if !ok {
-			continue
-		}
-
-		for j, item := range rowItems {
-			btn, ok := item.(map[string]interface{})
-			if !ok {
-				continue
-			}
-
-			// Generate callback data
-			hash := GenerateCallbackHash(index)
-			btn["callback_data"] = hash
-
-			// Update in place
-			tgMessage["reply_markup"].(map[string]interface{})["inline_keyboard"].([]interface{})[i].([]interface{})[j] = btn
-
-			// Prepare callback data for saving
-			data := &CallbackData{
-				Project:   action.Project,
-				UserID:    action.User.ID,
-				QueryData: hash,
-			}
-
-			if action.Content.Actions != nil && index < len(action.Content.Actions) {
-				data.Action = action.Content.Actions[index]
-			}
-
-			callbackQueries = append(callbackQueries, data)
-			index++
-		}
-	}
-
-	// Save all callback data in batch
-	if callbackSaver != nil && len(callbackQueries) > 0 {
-		if err := callbackSaver.SaveCallbackDataBatch(ctx, callbackQueries); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-// buildVirtualKeyboard builds virtual (reply) keyboard
-func (c *Client) buildVirtualKeyboard(action *Action, tgMessage map[string]interface{}, colNum int) {
+// buildReplyKeyboardMarkup builds reply keyboard from buttons
+func (c *Client) buildReplyKeyboardMarkup(action *Action, colNum int) tgbotapi.ReplyKeyboardMarkup {
 	rowCount := int(math.Ceil(float64(len(action.Content.Buts)) / float64(colNum)))
-	keyboard := make([][]string, rowCount)
+	keyboard := make([][]tgbotapi.KeyboardButton, 0, rowCount)
 
-	for i, k := 0, 0; i < len(action.Content.Buts); i += colNum {
-		var row []string
+	for i := 0; i < len(action.Content.Buts); i += colNum {
+		var row []tgbotapi.KeyboardButton
 		for j := 0; j < colNum && (i+j) < len(action.Content.Buts); j++ {
-			row = append(row, action.Content.Buts[i+j])
+			row = append(row, tgbotapi.NewKeyboardButton(action.Content.Buts[i+j]))
 		}
-		keyboard[k] = row
-		k++
+		keyboard = append(keyboard, row)
 	}
 
-	tgMessage["reply_markup"] = map[string]interface{}{
-		"keyboard":          keyboard,
-		"resize_keyboard":   true,
-		"one_time_keyboard": true,
+	return tgbotapi.ReplyKeyboardMarkup{
+		Keyboard:        keyboard,
+		ResizeKeyboard:  true,
+		OneTimeKeyboard: true,
 	}
 }
