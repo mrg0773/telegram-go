@@ -121,7 +121,18 @@ func (c *Client) SendMessage(ctx context.Context, chatID int64, text string, opt
 		)
 	}
 
+	start := time.Now()
 	sent, err := c.bot.Send(msg)
+	duration := time.Since(start)
+
+	if c.logger != nil {
+		c.logger.Debug("telegram API response",
+			zap.String("method", "sendMessage"),
+			zap.Duration("tg_api_duration", duration),
+			zap.Bool("success", err == nil),
+		)
+	}
+
 	if err != nil {
 		return nil, c.wrapError(err)
 	}
@@ -617,7 +628,18 @@ func (c *Client) Call(ctx context.Context, method string, params map[string]inte
 		}
 	}
 
+	start := time.Now()
 	resp, err := c.bot.MakeRequest(method, tgParams)
+	duration := time.Since(start)
+
+	if c.logger != nil {
+		c.logger.Debug("telegram API response",
+			zap.String("method", method),
+			zap.Duration("tg_api_duration", duration),
+			zap.Bool("success", err == nil),
+		)
+	}
+
 	if err != nil {
 		return nil, c.wrapError(err)
 	}
